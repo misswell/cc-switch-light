@@ -73,7 +73,7 @@ pub use mcp::{
 pub use prompt::Prompt;
 pub use provider::{Provider, ProviderMeta};
 pub use services::{
-    profile::{ProfilePayload, ProfileScope, ProfileService},
+    profile::{ProfilePayload, ProfileScope, ProfileService, NO_ACTIVE_PROMPT},
     provider::{reapply_current_codex_official_live, EditorSave, EditorView},
     skill::{migrate_skills_to_ssot, ImportSkillSelection},
     ConfigService, EndpointLatency, McpService, PromptService, ProviderService, ProxyService,
@@ -1200,10 +1200,12 @@ pub fn run() {
             // 冷启动补取：Windows/Linux 上插件在自身初始化时就解析了启动参数并发出事件，
             // macOS 的 Opened 也可能早于这里，都赶在上面的回调注册之前，只能从 get_current 取。
             // 万一两边都处理了同一条链接也无妨：暂存区只留最新一条，前端处理完就清除。
+            let mut startup_deeplink = false;
             match app.deep_link().get_current() {
                 Ok(Some(urls)) => {
                     for url in urls {
                         if handle_deeplink_url(app.handle(), url.as_str(), true, "get_current") {
+                            startup_deeplink = true;
                             break;
                         }
                     }
@@ -1328,6 +1330,21 @@ pub fn run() {
                 use crate::services::agy_account::AgyAccountManager;
                 let manager = AgyAccountManager::new(crate::config::get_app_config_dir());
                 app.manage(commands::AgyAccountState(Arc::new(manager)));
+            }
+
+            // Claude Code 官方订阅账号（授权中心加号；每个账号一个 CLAUDE_CONFIG_DIR）
+            {
+                use crate::services::claude_account::ClaudeAccountManager;
+                let data_dir = crate::config::get_app_config_dir();
+                let manager = ClaudeAccountManager::new(data_dir.clone());
+                app.manage(commands::ClaudeAccountState(Arc::new(manager)));
+                let db = app.state::<AppState>().db.clone();
+                std::thread::spawn(move || {
+                    // 上次切换登录时崩溃、断电：先补完（配置操作在前面已补完，指针已落定）
+                    crate::services::provider::claude_official::recover_login_switch(&db);
+                    // 默认目录的设置、MCP 可能在 CC Switch 没运行时改过
+                    crate::services::claude_account::sync_all_shared(&data_dir)
+                });
             }
 
             // 初始化全局出站代理 HTTP 客户端
@@ -1487,9 +1504,10 @@ pub fn run() {
 
             // 静默启动：根据设置决定是否显示主窗口
             let settings = crate::settings::get_settings();
-            if settings.lightweight_mode {
+            if settings.lightweight_mode && !startup_deeplink {
                 // 记住的轻量模式：主窗口保持隐藏，等事件循环 Ready 后立即
                 // 销毁、仅托盘运行（见 run() 的 RunEvent::Ready 分支）。
+                // 深链接冷启动例外：要给用户看导入对话框，按正常启动显示窗口。
                 log::info!("记住的轻量模式：主窗口保持隐藏，即将自动进入轻量模式");
             } else if let Some(window) = app.get_webview_window("main") {
                 // 在窗口首次显示前同步装饰状态，避免前端加载后再切换导致标题栏闪烁
@@ -1502,6 +1520,7 @@ pub fn run() {
                     let _ = window.set_decorations(false);
                     let _ = window.set_shadow(true);
                 }
+                // 走到这里说明启动后要正常显示窗口（非记住的轻量模式，或深链接冷启动）。
                 if settings.silent_startup {
                     // 静默启动模式：保持窗口隐藏
                     let _ = window.hide();
@@ -1894,6 +1913,10 @@ pub fn run() {
             commands::auth_logout,
             commands::agy_account_is_running,
             commands::agy_account_quota,
+            commands::claude_account_submit_paste,
+            commands::get_claude_account_quota,
+            commands::get_claude_default_plan,
+            commands::get_claude_login_switch,
             commands::kimi_oauth_status,
             commands::kimi_oauth_start,
             commands::kimi_oauth_poll,
@@ -1950,8 +1973,10 @@ pub fn run() {
         // 放在 Ready 而非 setup 里做：此时 ExitRequested 的 StayInTray 拦截
         // 已生效，销毁窗口触发的退出请求不会结束进程；窗口自创建起从未
         // 显示，也不会闪现。数据库恢复模式没有托盘可唤回，跳过。
+        // 深链接冷启动时保留窗口，让用户先处理导入对话框（与上游一致）。
         if matches!(event, RunEvent::Ready)
             && crate::settings::get_settings().lightweight_mode
+            && crate::deeplink::peek_pending_deeplink().is_none()
             && crate::init_status::get_init_error().is_none()
         {
             if let Err(e) = crate::lightweight::enter_lightweight_mode(app_handle) {

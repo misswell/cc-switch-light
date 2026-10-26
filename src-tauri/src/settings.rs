@@ -1230,6 +1230,14 @@ pub fn clear_codex_unify_migrate_existing() -> Result<(), AppError> {
     })
 }
 
+/// 记下当前是否处于轻量模式（见 [`AppSettings::lightweight_mode`]），值没变就不写盘。
+pub fn set_lightweight_mode(enabled: bool) -> Result<(), AppError> {
+    if get_settings().lightweight_mode == enabled {
+        return Ok(());
+    }
+    mutate_settings(|settings| settings.lightweight_mode = enabled)
+}
+
 /// 客户端地址（见 [`AppSettings::proxy_client_host`]），去掉首尾空白；没设或为空时是 `None`。
 pub fn get_proxy_client_host() -> Option<String> {
     get_settings()
